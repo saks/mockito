@@ -1,10 +1,10 @@
-use std::io::Read;
-use std::mem;
-use std::str;
 use std::convert::From;
 use std::default::Default;
-use std::net::TcpStream;
 use std::fmt;
+use std::io::Read;
+use std::mem;
+use std::net::TcpStream;
+use std::str;
 
 use httparse;
 
@@ -35,20 +35,55 @@ impl Request {
     }
 
     pub fn find_header_values(&self, searched_field: &str) -> Vec<&str> {
-        self.headers.iter().filter_map(|(field, value)| {
-            if field == searched_field {
-                Some(value.as_str())
-            } else {
-                None
-            }
-        }).collect()
+        self.headers
+            .iter()
+            .filter_map(|(field, value)| {
+                if field == searched_field {
+                    Some(value.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn record_last_header(&mut self) {
         if self.last_header_field.is_some() && self.last_header_value.is_some() {
             let last_header_field = mem::replace(&mut self.last_header_field, None).unwrap();
             let last_header_value = mem::replace(&mut self.last_header_value, None).unwrap();
-            self.headers.push((last_header_field.to_lowercase(), last_header_value));
+            self.headers
+                .push((last_header_field.to_lowercase(), last_header_value));
+        }
+    }
+
+    fn content_length(&self) -> usize {
+        use std::str::FromStr;
+
+        self.find_header_values("content-length")
+            .first()
+            .and_then(|len| usize::from_str(*len).ok())
+            .unwrap_or(0)
+    }
+
+    fn read_request_body(&mut self, stream: &mut TcpStream) {
+        let expected_content_length = self.content_length();
+
+        loop {
+            if self.body.len() == expected_content_length {
+                break;
+            }
+
+            let mut body_buf = [0; 1024];
+
+            let body_read_len = match stream.read(&mut body_buf) {
+                Ok(read_body_len) => read_body_len,
+                Err(e) => {
+                    self.error = Some(e.to_string());
+                    0
+                }
+            };
+
+            self.body.extend_from_slice(&body_buf[..body_read_len]);
         }
     }
 }
@@ -72,36 +107,71 @@ impl Default for Request {
 impl<'a> From<&'a mut TcpStream> for Request {
     fn from(stream: &mut TcpStream) -> Self {
         let mut request = Self::default();
-        let mut buf = [0; 1024];
 
-        let rlen = match stream.read(&mut buf) {
-            Err(e) => Err(e.to_string()),
-            Ok(0)  => Err("Nothing to read.".into()),
-            Ok(i)  => Ok(i)
-        }.map_err(|e| request.error = Some(e)).unwrap_or(0);
-        if rlen == 0 {
-            return request;
+        let mut all_buf = Vec::new();
+
+        loop {
+            if request.is_parsed {
+                break;
+            }
+
+            let mut headers = [httparse::EMPTY_HEADER; 16];
+            let mut req = httparse::Request::new(&mut headers);
+            let mut buf = [0; 1024];
+
+            let rlen = match stream.read(&mut buf) {
+                Err(e) => Err(e.to_string()),
+                Ok(0) => Err("Nothing to read.".into()),
+                Ok(i) => Ok(i),
+            }
+            .map_err(|e| request.error = Some(e))
+            .unwrap_or(0);
+
+            if rlen == 0 {
+                break;
+            }
+
+            all_buf.extend_from_slice(&buf[..rlen]);
+
+            let _ = req
+                .parse(&all_buf)
+                .map_err(|e| {
+                    request.error = Some(e.to_string());
+                })
+                .and_then(|status| match status {
+                    httparse::Status::Complete(head_len) => {
+                        if let Some(a @ 0...1) = req.version {
+                            request.version = (1, a)
+                        }
+                        if let Some(a) = req.method {
+                            request.method += a
+                        }
+                        if let Some(a) = req.path {
+                            request.path += a
+                        }
+                        for h in req.headers {
+                            request.last_header_field = Some(h.name.to_lowercase());
+                            request.last_header_value =
+                                Some(String::from_utf8_lossy(h.value).to_string());
+
+                            request.record_last_header();
+                        }
+
+                        request.body.extend_from_slice(&all_buf[head_len..]);
+
+                        let more_body_to_read = all_buf.len() < head_len + request.content_length();
+
+                        if more_body_to_read {
+                            request.read_request_body(stream);
+                        }
+                        request.is_parsed = true;
+
+                        Ok(())
+                    }
+                    httparse::Status::Partial => Ok(()),
+                });
         }
 
-        let mut headers = [httparse::EMPTY_HEADER; 16];
-        let mut req = httparse::Request::new(&mut headers);
-        let _ = req.parse(&buf).map_err(|e|{
-            request.error = Some(e.to_string());
-        }).and_then(|p| {
-            if let Some(a @ 0 ... 1) = req.version { request.version = (1,a) }
-            if let Some(a)           = req.method  { request.method += a }
-            if let Some(a)           = req.path    { request.path += a }
-            for h in req.headers {
-                request.last_header_field = Some(h.name.to_lowercase());
-                request.last_header_value = Some(String::from_utf8_lossy(h.value).into());
-                request.record_last_header();
-            }
-            if let httparse::Status::Complete(plen) = p {
-                request.is_parsed = true;
-                request.body.extend_from_slice(&buf[plen..rlen]);
-            }
-            Ok(())
-        });
         request
     }
 }
